@@ -1,6 +1,6 @@
 # (c) 2023 Andreas Rumpf
 
-import std / [atomics, locks, tasks, times]
+import std / [atomics, tasks, times]
 from std / os import sleep
 
 import std / isolation
@@ -13,9 +13,8 @@ template withTTASLock(lock: var Atomic[bool]; bode: untyped): untyped =
     bode
 
 template withTTASLock(lock: var Atomic[bool]; andCond: untyped; bode: untyped): untyped =
-  var unlocked = false
   while true:
-    if lock.load(moRelaxed):
+    if lock.load moRelaxed:
       cpuRelax()
       continue
     if lock.exchange(true, moAcquire):
@@ -25,74 +24,67 @@ template withTTASLock(lock: var Atomic[bool]; andCond: untyped; bode: untyped): 
       # we unlocked but other condition failed, release it
       lock.store(false, moRelaxed)
       cpuRelax()
-      # echo getThreadId(), " unlocked but ", andCond
       continue
-    #echo getThreadId(), " unlocked and ", andCond
     break
   try:
     bode
   finally:
-    # echo getThreadId(), " released"
-    lock.store(false, moRelease)
+    lock.store false, moRelease
 
 type
   Master* = object ## Masters can spawn new tasks inside an `awaitAll` block.
-    L: Atomic[bool]
-    error: string
-    runningTasks: int
-    stopToken: Atomic[bool]
-    shouldEndAt: Time
-    usesTimeout: bool
+    constrained: bool
+    error:       string
+    lock:        Atomic[bool]
+    running:     Atomic[int]
+    stop:        Atomic[bool]
+    timeout:     Time
 
-
-proc `=copy`(dest: var Master; src: Master) {.error.} =
-  echo "dolly"
-proc `=sink`(dest: var Master; src: Master) {.error.} =
-  echo "flushed way"
+proc `=copy`(dest: var Master; src: Master) {.error.}
+proc `=sink`(dest: var Master; src: Master) {.error.}
 
 proc createMaster*(timeout = default(Duration)): Master =
   result = default(Master)
-  result.L.store(false, moRelaxed)
-  result.stopToken.store(false, moRelaxed)
+  result.lock.store false, moRelaxed
+  result.stop.store false, moRelaxed
   if timeout != default(Duration):
-    result.usesTimeout = true
-    result.shouldEndAt = getTime() + timeout
+    result.constrained = true
+    result.timeout     = getTime() + timeout
 
 proc cancel*(m: var Master) =
   ## Try to stop all running tasks immediately.
   ## This cannot fail but it might take longer than desired.
-  store(m.stopToken, true, moRelaxed)
+  m.stop.store true, moRelaxed
 
 proc cancelled*(m: var Master): bool {.inline.} =
-  m.stopToken.load(moRelaxed)
+  m.stop.load moRelaxed
 
 proc taskCreated(m: var Master) {.inline.} =
-  withTTASLock m.L:
-    inc m.runningTasks
+  m.running.atomicInc 1
 
 proc taskCompleted(m: var Master) {.inline.} =
-  withTTASLock m.L:
-    dec m.runningTasks
+  m.running.atomicDec 1
 
 proc stillHaveTime*(m: Master): bool {.inline.} =
-  not m.usesTimeout or getTime() < m.shouldEndAt
+  not m.constrained or getTime() < m.timeout
+
+const
+  ThrSleepInMs   {.intdefine.} = 10
 
 proc waitForCompletions(m: var Master) =
   var timeoutErr = false
-  if not m.usesTimeout:
-    withTTASLock m.L, m.runningTasks < 1:
+  if not m.constrained:
+    while m.running.load(moRelaxed) > 1:
       discard
   else:
     while true:
-      if m.L.load(moRelaxed):
-        continue
-      let success = m.runningTasks == 0
+      let success = m.running.load(moRelaxed) == 0
       if success: break
-      if getTime() > m.shouldEndAt:
+      if getTime() > m.timeout:
         timeoutErr = true
         break
-      sleep(10) # XXX maybe make more precise
-  withTTASLock m.L:
+      sleep(ThrSleepInMs) # XXX maybe make more precise
+  withTTASLock m.lock:
     let err = move(m.error)
     if err.len > 0:
       raise newException(ValueError, err)
@@ -103,9 +95,8 @@ proc waitForCompletions(m: var Master) =
 # thread pool independent of the 'master':
 
 const
-  FixedChanSize {.intdefine.} = 8 ## must be a power of two!
-  FixedChanMask = FixedChanSize - 1
-  ThreadPoolSize {.intdefine.} = 8 # 24
+  FixedChanSize  {.intdefine.} = 8  ## must be a power of two!
+  ThreadPoolSize {.intdefine.} = 8
 
 type
   ThreadState = enum
@@ -117,36 +108,47 @@ type
     tsFail
     tsCancel
 
-  PoolTask = object ## a task for the thread pool
-    m: ptr Master   ## who is waiting for us
-    t: Task         ## what to do
-    result: pointer ## where to store the potential result
+  PoolTask = object      ## a task for the thread pool
+    m:      ptr Master   ## who is waiting for us
+    t:      Task         ## what to do
+    result: pointer      ## where to store the potential result
 
   FixedChan = object ## channel of a fixed size
-    L: Atomic[bool]
+    L:     Atomic[bool]
     board: array[FixedChanSize, Atomic[ThreadState]]
-    data: array[FixedChanSize, PoolTask]
+    data:  array[FixedChanSize, PoolTask]
 
 var
-  thr: array[ThreadPoolSize, Thread[int]]
-  chan: FixedChan
+  thr:             array[ThreadPoolSize, Thread[int]]
+  chan:            FixedChan
   globalStopToken: Atomic[bool]
-  busyThreads: Atomic[int]
-  curretThread: Atomic[int]
+  busyThreads:     Atomic[int]
+  curretThread:    Atomic[int]
+
 
 iterator threads(): int {.inline.} =
-  while true:
-    #var epoch = getMonoTime()
-    var n = curretThread.fetchAdd(1)
-    if n == FixedChanSize - 1:
-      curretThread.store(0, moRelaxed)
-    #echo inNanoseconds(getMonoTime() - epoch)
-    yield n
+  # The default algorithm is roud-robin
+  # it more likelly to keep all threads awake
+  # is faster but uses more energy
+  when defined lowEnergy:
+    var n = high(thr)
+    while true:
+      yield n
+      dec n
+      if n < 0:
+        n = high(thr)
+  else:
+    var n: int
+    while true:
+      n = curretThread.fetchSub(1)
+      if n < 0:
+        n = high(thr)
+        curretThread.store(n - 1, moRelaxed)
+      yield n
 
 proc send(item: sink PoolTask) =
-  # see deques.addLast:
   var 
-    done = tsDone
+    done  = tsDone
     empty = tsEmpty
     ackchyually = 0
 
@@ -177,7 +179,17 @@ proc worker(i: int) {.thread.} =
     item: PoolTask
     todo = tsToDo
     wip  = tsWip
+
+  when defined lowEnergy:
+    let maxIdleTime = ThrSleepInMs / 100.0
+    var lastWorkAt  = cpuTime()
+
   while not globalStopToken.load(moRelaxed):
+    when defined lowEnergy:
+      var now = cpuTime()
+      if lastWorkAt - now > maxIdleTime:
+        sleep(ThrSleepInMs)
+
     # Test
     if chan.board[i].load(moRelaxed) != todo:
       cpuRelax()
@@ -188,9 +200,12 @@ proc worker(i: int) {.thread.} =
       cpuRelax()
       continue
 
+    when defined lowEnergy:
+      lastWorkAt = now
+
     item = move chan.data[i]
 
-    if not item.m.stopToken.load(moRelaxed):
+    if not item.m.stop.load(moRelaxed):
       try:
         atomicInc busyThreads
         item.t.invoke(item.result)
@@ -200,7 +215,7 @@ proc worker(i: int) {.thread.} =
       except:
         discard chan.board[i].compareExchange(wip,
           tsFail, moRelease, moRelease)
-        withTTASLock item.m.L:
+        withTTASLock item.m.lock:
           if item.m.error.len == 0:
             let e = getCurrentException()
             item.m.error = "SPAWN FAILURE: [" & $e.name & "] " & e.msg & "\n" & getStackTrace(e)
@@ -209,10 +224,11 @@ proc worker(i: int) {.thread.} =
     taskCompleted item.m[]
 
 proc setup() =
-  chan.L.store(false, moRelaxed)
-  globalStopToken.store(false, moRelaxed)
+  chan.L.store           false, moRelaxed
+  globalStopToken.store  false, moRelaxed
+  curretThread.store high(thr), moRelaxed
   for i in 0..high(thr):
-    chan.board[i].store(tsEmpty, moRelaxed)
+    chan.board[i].store tsEmpty, moRelaxed
     createThread[int](thr[i], worker, i)
 
 proc panicStop*() =
