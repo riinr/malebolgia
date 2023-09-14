@@ -6,35 +6,11 @@ from std / os import sleep
 import std / isolation
 export isolation
 
-const LOCK_IT = true
-
-template withTTASLock(lock: var Atomic[bool]; bode: untyped): untyped =
-  withTTASLock lock, LOCK_IT:
-    bode
-
-template withTTASLock(lock: var Atomic[bool]; andCond: untyped; bode: untyped): untyped =
-  while true:
-    if lock.load moRelaxed:
-      cpuRelax()
-      continue
-    if lock.exchange(true, moAcquire):
-      cpuRelax()
-      continue
-    if not andCond:
-      # we unlocked but other condition failed, release it
-      lock.store(false, moRelaxed)
-      cpuRelax()
-      continue
-    break
-  try:
-    bode
-  finally:
-    lock.store false, moRelease
 
 type
   Master* = object ## Masters can spawn new tasks inside an `awaitAll` block.
     constrained: bool
-    error:       string
+    error:       Atomic[string]
     lock:        Atomic[bool]
     running:     Atomic[int]
     stop:        Atomic[bool]
@@ -45,6 +21,7 @@ proc `=sink`(dest: var Master; src: Master) {.error.}
 
 proc createMaster*(timeout = default(Duration)): Master =
   result = default(Master)
+  result.error.store "",   moRelaxed
   result.lock.store false, moRelaxed
   result.stop.store false, moRelaxed
   if timeout != default(Duration):
@@ -68,8 +45,7 @@ proc taskCompleted(m: var Master) {.inline.} =
 proc stillHaveTime*(m: Master): bool {.inline.} =
   not m.constrained or getTime() < m.timeout
 
-const
-  ThrSleepInMs   {.intdefine.} = 10
+const ThrSleepInMs   {.intdefine.} = 10
 
 proc waitForCompletions(m: var Master) =
   var timeoutErr = false
@@ -84,18 +60,16 @@ proc waitForCompletions(m: var Master) =
         timeoutErr = true
         break
       sleep(ThrSleepInMs) # XXX maybe make more precise
-  withTTASLock m.lock:
-    let err = move(m.error)
-    if err.len > 0:
-      raise newException(ValueError, err)
-    elif timeoutErr:
-      m.cancel()
-      raise newException(ValueError, "'awaitAll' timeout")
+  let err = m.error.load(moRelaxed)
+  if err.len > 0:
+    raise newException(ValueError, err)
+  elif timeoutErr:
+    m.cancel()
+    raise newException(ValueError, "'awaitAll' timeout")
 
 # thread pool independent of the 'master':
 
 const
-  FixedChanSize  {.intdefine.} = 8  ## must be a power of two!
   ThreadPoolSize {.intdefine.} = 8
 
 type
@@ -115,8 +89,8 @@ type
 
   FixedChan = object ## channel of a fixed size
     L:     Atomic[bool]
-    board: array[FixedChanSize, Atomic[ThreadState]]
-    data:  array[FixedChanSize, PoolTask]
+    board: array[ThreadPoolSize, Atomic[ThreadState]]
+    data:  array[ThreadPoolSize, PoolTask]
 
 var
   thr:             array[ThreadPoolSize, Thread[int]]
@@ -128,7 +102,7 @@ var
 
 iterator threads(): int {.inline.} =
   # The default algorithm is roud-robin
-  # it more likelly to keep all threads awake
+  # is more likelly to keep all threads awake
   # is faster but uses more energy
   when defined lowEnergy:
     var n = high(thr)
@@ -215,10 +189,12 @@ proc worker(i: int) {.thread.} =
       except:
         discard chan.board[i].compareExchange(wip,
           tsFail, moRelease, moRelease)
-        withTTASLock item.m.lock:
-          if item.m.error.len == 0:
-            let e = getCurrentException()
-            item.m.error = "SPAWN FAILURE: [" & $e.name & "] " & e.msg & "\n" & getStackTrace(e)
+        if item.m.error.load(moRelaxed).len == 0:
+          let e = getCurrentException()
+          item.m.error.store(
+            "SPAWN FAILURE: [" & $e.name & "] " & e.msg & "\n" & getStackTrace(e),
+            moRelaxed
+          )
 
     # but mark it as completed either way!
     taskCompleted item.m[]
