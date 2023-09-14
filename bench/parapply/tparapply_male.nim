@@ -9,7 +9,13 @@
 
 
 import std/[times, monotimes, strutils]
-import malebolgia
+
+when defined spin:
+  import malebolgia_spin
+elif defined spinDoctors:
+  import malebolgia_spin_doctors
+else:
+  import malebolgia
 
 var 
   bigbang = getMonoTime()
@@ -40,74 +46,56 @@ template parApply*[T](data: var openArray[T]; bulkSize: int; op: untyped) =
     if i < data.len:
       m.spawn worker(data@!i, data.len-i)
 
-
 proc now(i: var MonoTime) {.inline.} =
   i = getMonoTime()
 
 
-let sep  = "\t"
-let runs = 100
-echo [
-  "OP",
-  "T0E0",
-  "T0E1",
-  "T1E0",
-  "T1E1",
-  "T2E0",
-  "T0E1-T0E0",
-  "T1E0-T0E1",
-].join(sep)
-var ops = [getMonoTime(), getMonoTime(), getMonoTime(), getMonoTime(), getMonoTime()]
-for i in 0..<runs:
-  var
-    ops = [epoch, epoch, epoch, epoch, epoch]
+proc ifmt(i: int): string =
+  if i < 10:
+    return "000" & $i
+  if i < 100:
+    return "00" & $i
+  if i < 1000:
+    return "0" & $i
+  return $i
 
-    # Overloading test
-    #
-    # ops = [
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch,
-    #     epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch, epoch
-    # ]
-  
+const
+  bulkSize   {.intdefine.} = 2
+  operations {.intdefine.} = 3 * bulkSize
+  runs       {.intdefine.} = 1000
+  separeator {.strdefine.} = "\t"
+
+let last = bulkSize - 1
+let sep = separeator
+var ops: array[operations, MonoTime]
+var header = "Setup" & sep & "Serial" & sep & "Spwn" & 0.ifmt & "E0 - Epoch"
+
+for i in 1..(high(ops) div bulkSize):
+  header &= sep & "Spwn" & i.ifmt  & "E0 - Epoch"
+
+for i in 1..(high(ops) div bulkSize):
+  header &= sep & "Spwn" & i.ifmt  & "E0 - Spwn" & ifmt(i - 1) & "E" & $last
+
+echo $header
+
+for i in 0..<runs:
+  for i in 0..high(ops):
+    ops[i] = epoch
+
   bigbang = getMonoTime()
-  parApply ops, 2, now
-  
-  echo [
-    $inNanoseconds(epoch  - bigbang),  # mesurement precision
-    $inNanoseconds(ops[0] - epoch),    # how fast we perform 1º task
-    $inNanoseconds(ops[1] - epoch),    # how fast we perform 2º task serial after 1º
-    $inNanoseconds(ops[2] - epoch),    # how fast we perform 3º task parallel
-    $inNanoseconds(ops[3] - epoch),    # how fast we perform 4º task serial after 3º
-    $inNanoseconds(ops[4] - epoch),    # how fast we perform 5º task parallel
-    $inNanoseconds(ops[1] - ops[0]),   # serial   latency
-    $inNanoseconds(ops[3] - ops[1]),   # parallel latency
-  ].join(sep)
+  parApply ops, bulkSize, now
+
+  var row =    $inNanoseconds(epoch  - bigbang)   # SETUP
+  row &= sep & $inNanoseconds(ops[1] - ops[0])    # how fast we perform in serial
+  row &= sep & $inNanoseconds(ops[0] - epoch)     # from start
+
+  for i in 1..(high(ops) div bulkSize):
+    let curr = i * bulkSize
+    row &= sep & $inNanoseconds(ops[curr] - epoch    )  # from epoch op
+  for i in 1..(high(ops) div bulkSize):
+    let curr = i * bulkSize
+    let prev = curr - 1
+    row &= sep & $inNanoseconds(ops[curr] - ops[prev])  # from prev  op
+
+  echo row
+
