@@ -19,8 +19,6 @@ binPath = binPath &
 
 binPath = binPath & "/parApply"
 
-when defined spin:
-  binPath = binPath & "Spin"
 when defined spinDoctors:
   binPath = binPath & "SpinDoctors"
   when defined lowEnergy:
