@@ -11,7 +11,6 @@ type
   Master* = object ## Masters can spawn new tasks inside an `awaitAll` block.
     constrained: bool
     error:       Atomic[string]
-    lock:        Atomic[bool]
     running:     Atomic[int]
     stop:        Atomic[bool]
     timeout:     Time
@@ -22,7 +21,6 @@ proc `=sink`(dest: var Master; src: Master) {.error.}
 proc createMaster*(timeout = default(Duration)): Master =
   result = default(Master)
   result.error.store "",   moRelaxed
-  result.lock.store false, moRelaxed
   result.stop.store false, moRelaxed
   if timeout != default(Duration):
     result.constrained = true
@@ -88,7 +86,6 @@ type
     result: pointer      ## where to store the potential result
 
   FixedChan = object ## channel of a fixed size
-    L:     Atomic[bool]
     board: array[ThreadPoolSize, Atomic[ThreadState]]
     data:  array[ThreadPoolSize, PoolTask]
 
@@ -96,40 +93,44 @@ var
   thr:             array[ThreadPoolSize, Thread[int]]
   chan:            FixedChan
   globalStopToken: Atomic[bool]
-  busyThreads:     Atomic[int]
-  curretThread:    Atomic[int]
+  currentThread:   Atomic[int]
 
 
 iterator threads(): int {.inline.} =
-  # The default algorithm is roud-robin
-  # is more likelly to keep all threads awake
-  # is faster but uses more energy
+  # The default algorithm is round-robin
+  # is slower for fast tasks
+  # maybe be better for slow tasks
   when defined lowEnergy:
     var n = high(thr)
     while true:
       yield n
-      dec n
-      if n < 0:
+      if n > 0:
+        dec n
+      else:
         n = high(thr)
+      cpuRelax()
   else:
     var n: int
     while true:
-      n = curretThread.fetchSub(1)
+      n = currentThread.fetchSub(1)
       if n < 0:
         n = high(thr)
-        curretThread.store(n - 1, moRelaxed)
+        currentThread.store(n - 1, moRelaxed)
       yield n
+      cpuRelax()
 
-proc send(item: sink PoolTask) =
+iterator send(item: sink PoolTask): bool {.inline.} =
   var 
+    ackchyually = 0
     done  = tsDone
     empty = tsEmpty
-    ackchyually = 0
+    full  = 0
 
   for i in threads():
+    yield full != ThreadPoolSize
+    inc full
     # Test
     if chan.board[i].load(moRelaxed) notin [done, empty]:
-      cpuRelax()
       continue
 
     # Test and Set
@@ -143,10 +144,10 @@ proc send(item: sink PoolTask) =
         tsFeeding, moAcquire, moRelease):
       ackchyually = i
       break
-    cpuRelax()
 
   chan.data[ackchyually] = item
   chan.board[ackchyually].store(tsToDo, moRelease)
+
 
 proc worker(i: int) {.thread.} =
   var
@@ -155,6 +156,7 @@ proc worker(i: int) {.thread.} =
     wip  = tsWip
 
   when defined lowEnergy:
+    sleep(i)
     let maxIdleTime = ThrSleepInMs / 100.0
     var lastWorkAt  = cpuTime()
 
@@ -181,9 +183,7 @@ proc worker(i: int) {.thread.} =
 
     if not item.m.stop.load(moRelaxed):
       try:
-        atomicInc busyThreads
         item.t.invoke(item.result)
-        atomicDec busyThreads
         discard chan.board[i].compareExchange(wip,
           tsDone, moRelease, moRelease)
       except:
@@ -200,9 +200,8 @@ proc worker(i: int) {.thread.} =
     taskCompleted item.m[]
 
 proc setup() =
-  chan.L.store           false, moRelaxed
-  globalStopToken.store  false, moRelaxed
-  curretThread.store high(thr), moRelaxed
+  globalStopToken.store  false,  moRelaxed
+  currentThread.store high(thr), moRelaxed
   for i in 0..high(thr):
     chan.board[i].store tsEmpty, moRelaxed
     createThread[int](thr[i], worker, i)
@@ -214,19 +213,16 @@ proc panicStop*() =
 
 template spawnImplRes[T](master: var Master; fn: typed; res: T) =
   if stillHaveTime(master):
-    if busyThreads.load(moRelaxed) < ThreadPoolSize:
-      taskCreated master
-      send PoolTask(m: addr(master), t: toTask(fn), result: addr res)
-    else:
-      res = fn
+    taskCreated master
+    for isBusy in send PoolTask(m: addr(master), t: toTask(fn), result: addr res):
+      if isBusy:
+        res = fn
 
 template spawnImplNoRes(master: var Master; fn: typed) =
   if stillHaveTime(master):
-    if busyThreads.load(moRelaxed) < ThreadPoolSize:
-      taskCreated master
-      send PoolTask(m: addr(master), t: toTask(fn), result: nil)
-    else:
-      fn
+    for isBusy in send PoolTask(m: addr(master), t: toTask(fn), result: nil):
+      if isBusy:
+        fn
 
 import std / macros
 
